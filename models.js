@@ -1,7 +1,7 @@
 import { DataTypes } from 'sequelize';
 import sequelize from './config/database.js';
 
-// Define Models
+// Models
 const Company = sequelize.define('Company', {
   name: { type: DataTypes.STRING, allowNull: false },
 });
@@ -31,14 +31,14 @@ const Product = sequelize.define('Product', {
 
 const Inventory = sequelize.define('Inventory', {
   quantity: { type: DataTypes.INTEGER, allowNull: false },
-}, { timestamps: false }); // No createdAt/updatedAt for this join table
+}, { timestamps: false }); 
 
 const InventoryMovementLog = sequelize.define('InventoryMovementLog', {
   quantity_change: { type: DataTypes.INTEGER, allowNull: false },
   reason: { type: DataTypes.STRING, allowNull: false }, // 'stock_in', 'sale', etc.
-}, { updatedAt: false }); // Only need createdAt
+}, { updatedAt: false });
 
-// Define Associations
+// Associations
 Company.hasMany(Warehouse, { foreignKey: 'companyId' });
 Warehouse.belongsTo(Company, { foreignKey: 'companyId' });
 

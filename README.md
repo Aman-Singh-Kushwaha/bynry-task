@@ -172,7 +172,7 @@ Justification:
 
   * **`UNIQUE (company_id, sku)`**: This constraint ensures a SKU is unique only within a company's list of products.
   * **`price DECIMAL`**: I used this because I’ve been told it's the right way to store money to avoid weird rounding errors.
-  * **`is_bundle`**: This is a simple `true/false` flag to tell the app if it's a bundle or a regular product.
+  * **`is_bundle`**: This is a simple `true/false` flag to tell the app if it's a bundle or a regular product. I included this to show I was thinking ahead about the "bundle" requirement, as it would be the foundation for more complex inventory logic later on.
 
 #### `inventory`
 
@@ -202,7 +202,7 @@ CREATE TABLE product_components (
 );
 ```
 
-Justification:  This just creates a link between a "bundle" product and its "component" products.
+Justification:  This just creates a link between a "bundle" product and its "component" products. This would be necessary to implement features like automatically decrementing component stock when a bundle is sold.
 
 #### `inventory_movement_log`
 
@@ -221,3 +221,117 @@ CREATE INDEX idx_log_query_performance ON inventory_movement_log(product_id, war
 ```
 
 Justification:  This table could get huge, so performance is key. I added a big composite index covering all the columns we'll search by for the alert query (`product_id`, `warehouse_id`, `reason`, and `created_at`).
+
+# Part 3: API Implementation
+
+For this part, I built the low-stock alert endpoint in Node.js/Express. Below is the final, corrected code and an explanation of my approach.
+
+### Final Implementation
+
+```javascript
+// From GET /companies/:companyId/alerts/low-stock in routes.js
+
+router.get('/companies/:companyId/alerts/low-stock', async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await Company.findByPk(companyId))) {
+            return res.status(404).json({ error: 'Company not found' });
+        }
+
+        // 1. Find all inventory items that are below their threshold
+        const lowStockItems = await Inventory.findAll({
+            include: [{
+                model: Product,
+                where: {
+                    companyId,
+                    [Op.and]: sequelize.where(sequelize.col('quantity'), '<=', sequelize.col('Product.low_stock_threshold'))
+                },
+                include: [{ model: Supplier, as: 'primarySupplier' }]
+            }, {
+                model: Warehouse
+            }],
+        });
+
+        if (lowStockItems.length === 0) {
+            return res.json({ alerts: [], total_alerts: 0 });
+        }
+
+        // 2. In a single query, get sales data for all low-stock items
+        const sixtyDaysAgo = new Date(new Date().setDate(new Date().getDate() - 60));
+        const salesData = await InventoryMovementLog.findAll({
+            attributes: [
+                'productId',
+                'warehouseId',
+                [sequelize.fn('SUM', sequelize.col('quantity_change')), 'totalSales'],
+                [sequelize.fn('MIN', sequelize.col('createdAt')), 'firstSaleDate']
+            ],
+            where: {
+                [Op.or]: lowStockItems.map(item => ({
+                    productId: item.productId,
+                    warehouseId: item.warehouseId
+                })),
+                reason: 'sale',
+                createdAt: { [Op.gte]: sixtyDaysAgo }
+            },
+            group: ['productId', 'warehouseId'],
+            raw: true
+        });
+
+        // 3. Create a lookup map for efficient data access
+        const salesMap = new Map(salesData.map(d => [`${d.productId}-${d.warehouseId}`, d]));
+        const alerts = [];
+        const today = new Date();
+
+        // 4. Process the items with the aggregated sales data
+        for (const item of lowStockItems) {
+            const sale = salesMap.get(`${item.productId}-${item.warehouseId}`);
+            const totalSalesInPeriod = sale ? Math.abs(sale.totalSales) : 0;
+
+            if (totalSalesInPeriod > 0) {
+                // FIX: Calculate the actual number of days the product was on sale
+                const firstSaleDate = new Date(sale.firstSaleDate);
+                const timeDiff = today.getTime() - firstSaleDate.getTime();
+                const daysOnSale = Math.max(1, Math.ceil(timeDiff / (1000 * 3600 * 24)));
+
+                const avgDailySales = totalSalesInPeriod / daysOnSale;
+                const daysUntilStockout = avgDailySales > 0 ? Math.floor(item.quantity / avgDailySales) : null;
+
+                const supplierInfo = item.Product.primarySupplier ? {
+                    id: item.Product.primarySupplier.id,
+                    name: item.Product.primarySupplier.name,
+                    contact_email: item.Product.primarySupplier.contact_email
+                } : null;
+
+                alerts.push({
+                    productId: item.Product.id,
+                    product_name: item.Product.name,
+                    sku: item.Product.sku,
+                    warehouseId: item.warehouseId,
+                    warehouse_name: item.Warehouse.name,
+                    current_stock: item.quantity,
+                    threshold: item.Product.low_stock_threshold,
+                    days_until_stockout: daysUntilStockout,
+                    supplier: supplierInfo
+                });
+            }
+        }
+
+        res.json({
+            alerts,
+            total_alerts: alerts.length
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'An internal error occurred' });
+    }
+});
+```
+
+### Explanation of Approach
+
+When building this endpoint, I focused on two main things: making it scalable and making the `days_until_stockout` calculation accurate.
+
+First, I realized that fetching sales data for each item one-by-one inside a loop would be very slow if a company had thousands of products. To solve this (an "N+1 query problem"), I changed the logic to be much more efficient. The code now fetches all the low-stock items first, then uses a single, powerful database query to pull the sales history for all of them at once. This keeps the API fast and responsive.
+
+The second, more critical, issue was the logical bug in calculating the `days_until_stockout`. Simply dividing total sales by 60 days gives a wildly incorrect estimate for new products. My solution fixes this by finding the date of the *very first sale* within the 60-day window. I then use that date to calculate the number of days the product has *actually* been on sale. This gives a much more realistic sales velocity and a trustworthy stockout prediction, which is crucial for a business relying on this data.

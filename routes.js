@@ -4,12 +4,10 @@ import { sequelize, Company, Warehouse, Supplier, Product, Inventory, InventoryM
 
 const router = Router();
 
-// Helper function for checking required fields
 const checkRequiredFields = (data, fields) => {
     return fields.every(field => data.hasOwnProperty(field));
 };
 
-// --- Creation Endpoints ---
 
 router.post('/companies', async (req, res) => {
   const { name } = req.body;
@@ -66,7 +64,7 @@ router.post('/companies/:companyId/products', async (req, res) => {
         return res.status(400).json({ error: `Missing required fields: ${requiredFields}` });
     }
 
-    const t = await sequelize.transaction(); // Start a transaction
+    const t = await sequelize.transaction();
 
     try {
         if (!(await Company.findByPk(companyId, { transaction: t }))) {
@@ -127,44 +125,64 @@ router.get('/companies/:companyId/alerts/low-stock', async (req, res) => {
             return res.status(404).json({ error: 'Company not found' });
         }
 
-        const sixtyDaysAgo = new Date(new Date().setDate(new Date().getDate() - 60));
-        const alerts = [];
-
-        // Step 1: Find all inventory items for the company that are at or below their threshold.
+        // 1. Find all inventory items that are below their threshold
         const lowStockItems = await Inventory.findAll({
             include: [{
                 model: Product,
                 where: {
                     companyId,
-                    // Using Op.col to compare two columns
-                    low_stock_threshold: { [Op.gte]: sequelize.col('Inventory.quantity') }
+                    [Op.and]: sequelize.where(sequelize.col('quantity'), '<=', sequelize.col('Product.low_stock_threshold'))
                 },
                 include: [{ model: Supplier, as: 'primarySupplier' }]
             }, {
                 model: Warehouse
-            }]
+            }],
         });
 
-        // Step 2: For each low-stock item, check for recent sales activity.
-        for (const item of lowStockItems) {
-            const salesResult = await InventoryMovementLog.findOne({
-                attributes: [[sequelize.fn('SUM', sequelize.col('quantity_change')), 'totalSales']],
-                where: {
-                    productId: item.productId,
-                    warehouseId: item.warehouseId,
-                    reason: 'sale',
-                    createdAt: { [Op.gte]: sixtyDaysAgo }
-                },
-                raw: true
-            });
+        if (lowStockItems.length === 0) {
+            return res.json({ alerts: [], total_alerts: 0 });
+        }
 
-            const totalSalesInPeriod = Math.abs(salesResult.totalSales || 0);
-            
+        // 2. In a single query, get sales data for all low-stock items
+        const sixtyDaysAgo = new Date(new Date().setDate(new Date().getDate() - 60));
+        const salesData = await InventoryMovementLog.findAll({
+            attributes: [
+                'productId',
+                'warehouseId',
+                [sequelize.fn('SUM', sequelize.col('quantity_change')), 'totalSales'],
+                [sequelize.fn('MIN', sequelize.col('createdAt')), 'firstSaleDate']
+            ],
+            where: {
+                [Op.or]: lowStockItems.map(item => ({
+                    productId: item.productId,
+                    warehouseId: item.warehouseId
+                })),
+                reason: 'sale',
+                createdAt: { [Op.gte]: sixtyDaysAgo }
+            },
+            group: ['productId', 'warehouseId'],
+            raw: true
+        });
+
+        // 3. Create a lookup map for efficient data access
+        const salesMap = new Map(salesData.map(d => [`${d.productId}-${d.warehouseId}`, d]));
+        const alerts = [];
+        const today = new Date();
+
+        // 4. Process the items with the aggregated sales data
+        for (const item of lowStockItems) {
+            const sale = salesMap.get(`${item.productId}-${item.warehouseId}`);
+            const totalSalesInPeriod = sale ? Math.abs(sale.totalSales) : 0;
+
             if (totalSalesInPeriod > 0) {
-                // Step 3: If there are sales, calculate days until stockout and build the alert.
-                const avgDailySales = totalSalesInPeriod / 60.0;
+                // FIX: Calculate the actual number of days the product was on sale
+                const firstSaleDate = new Date(sale.firstSaleDate);
+                const timeDiff = today.getTime() - firstSaleDate.getTime();
+                const daysOnSale = Math.max(1, Math.ceil(timeDiff / (1000 * 3600 * 24)));
+
+                const avgDailySales = totalSalesInPeriod / daysOnSale;
                 const daysUntilStockout = avgDailySales > 0 ? Math.floor(item.quantity / avgDailySales) : null;
-                
+
                 const supplierInfo = item.Product.primarySupplier ? {
                     id: item.Product.primarySupplier.id,
                     name: item.Product.primarySupplier.name,
@@ -191,7 +209,7 @@ router.get('/companies/:companyId/alerts/low-stock', async (req, res) => {
         });
 
     } catch (error) {
-        console.error(error); 
+        console.error(error);
         res.status(500).json({ error: 'An internal error occurred' });
     }
 });
